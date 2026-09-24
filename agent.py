@@ -21,6 +21,9 @@ class Agent:
             ally["unit_id"]: ally["position"]
             for ally in visible.allies(observation)
         }
+        # A fixed destination on the opposing side gives melee units a goal before
+        # an enemy enters vision, including when terrain blocks the direct route.
+        self.advance_goal = tile.at_mirror(me.position(observation), observation)
 
     def act(self, observation: SkirmishObservation) -> SkirmishAction:
         # Refresh any allies currently in view, while retaining their last known locations.
@@ -35,6 +38,11 @@ class Agent:
         enemies = visible.enemies(observation)
 
         if not enemies:
+            if me.unit_type(observation) in {"footman", "cavalry"}:
+                advance = self._path_toward(observation, self.advance_goal)
+                if advance:
+                    return action.move(advance)
+
             # At the beginning of a default skirmish match, units sit apart and see no enemies.
             # me.direction is the digit toward the enemy side, so this unit heads that way.
             forward = me.direction(observation)
@@ -77,36 +85,32 @@ class Agent:
                     return action.move(retreat, nearest["unit_id"], observation)
             return action.stay(nearest["unit_id"], observation)
 
-        # Footmen and cavalry continue to advance on the nearest visible enemy.
+        # Footmen and cavalry use their full legal route toward the nearest visible enemy.
 
-        # The step that gets closest to the enemy, or 0 when no step gets closer.
-        step = self._step_toward(observation, nearest["position"])
+        path = self._path_toward(observation, nearest["position"])
 
         # Naming a target makes the strike prefer that enemy. Any visible enemy can be named,
         # so both orders below are legal.
-        if step == 0:
+        if path == 0:
             return action.stay(nearest["unit_id"], observation)
-        return action.move(step, nearest["unit_id"], observation)
+        return action.move(path, nearest["unit_id"], observation)
 
-    def _step_toward(self, observation: SkirmishObservation, goal: AxialPosition) -> int:
-        """Return the single step that most closes the gap to goal, or 0 when none does."""
-        # TODO(you): only single steps are tried here. A path can contain four steps, and cavalry
-        # has four movement points, so most of that speed goes to waste.
+    def _path_toward(self, observation: SkirmishObservation, goal: AxialPosition) -> int:
+        """Return the legal path whose final tile is nearest to goal."""
         here = me.position(observation)
+        routes = [path_id for path_id in action.legal_paths(observation) if path_id != 0]
+        if not routes:
+            return 0
 
-        # Standing still is path id 0. A step must reduce the distance to be worth taking.
-        best_step = 0
-        best_distance = tile.distance(here, goal)
-
-        for step in action.legal_steps(observation):
-            # at_path_end gives the landing tile, so this is the distance after the step.
-            step_distance = tile.distance(tile.at_path_end(here, step), goal)
-
-            # Remember this step if it is the best one so far.
-            if step_distance < best_distance:
-                best_step, best_distance = step, step_distance
-
-        return best_step
+        # Trying every affordable path lets a unit spend its movement points and take
+        # a detour around terrain or occupied tiles when the direct direction is blocked.
+        return min(
+            routes,
+            key=lambda path_id: (
+                tile.distance(tile.at_path_end(here, path_id), goal),
+                -len(paths.decode(path_id)),
+            ),
+        )
 
     def _step_away_from_enemies(
         self,

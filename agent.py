@@ -7,6 +7,8 @@ Read ``environment.md`` beside this file for the rules, helpers, and first impro
 episode state in ``reset``. The constructor takes no arguments.
 """
 
+from heapq import heappop, heappush
+
 from sandbox.crane import action, me, paths, tile, units, visible
 from sandbox.observation_types import AxialPosition, SkirmishAction, SkirmishObservation
 
@@ -96,21 +98,73 @@ class Agent:
         return action.move(path, nearest["unit_id"], observation)
 
     def _path_toward(self, observation: SkirmishObservation, goal: AxialPosition) -> int:
-        """Return the legal path whose final tile is nearest to goal."""
+        """Return the legal path with the shortest terrain route remaining to goal."""
         here = me.position(observation)
         routes = [path_id for path_id in action.legal_paths(observation) if path_id != 0]
         if not routes:
             return 0
 
-        # Trying every affordable path lets a unit spend its movement points and take
-        # a detour around terrain or occupied tiles when the direct direction is blocked.
+        route_distances = self._terrain_distances(observation, goal)
+
+        # Trying every affordable path lets a unit spend its movement points. The
+        # terrain route distance, rather than straight-line distance, sends units
+        # around water and other impassable map features.
         return min(
             routes,
             key=lambda path_id: (
-                tile.distance(tile.at_path_end(here, path_id), goal),
+                route_distances.get(
+                    self._position_key(tile.at_path_end(here, path_id)), float("inf")
+                ),
                 -len(paths.decode(path_id)),
             ),
         )
+
+    def _terrain_distances(
+        self, observation: SkirmishObservation, goal: AxialPosition
+    ) -> dict[tuple[int, int], int]:
+        """Map every passable tile to its terrain-aware movement cost to goal."""
+        goal_key = self._position_key(goal)
+        distances = {goal_key: 0}
+        queue = [(0, goal_key)]
+
+        # Work backwards from the goal. This means moving from a tile to its neighbor
+        # pays the cost to enter that neighbor, matching the game's movement rules.
+        while queue:
+            distance, current_key = heappop(queue)
+            if distance != distances[current_key]:
+                continue
+
+            current = {"q": current_key[0], "r": current_key[1]}
+            entry_cost = self._movement_cost(observation, current)
+            for neighbor in tile.neighbors(current).values():
+                neighbor_key = self._position_key(neighbor)
+                if self._movement_cost(observation, neighbor) is None:
+                    continue
+
+                candidate = distance + entry_cost
+                if candidate < distances.get(neighbor_key, float("inf")):
+                    distances[neighbor_key] = candidate
+                    heappush(queue, (candidate, neighbor_key))
+
+        return distances
+
+    @staticmethod
+    def _position_key(position: AxialPosition) -> tuple[int, int]:
+        return position["q"], position["r"]
+
+    @staticmethod
+    def _movement_cost(observation: SkirmishObservation, position: AxialPosition) -> int | None:
+        """Return the movement cost to enter position, or None for impassable tiles."""
+        terrain = tile.terrain_at(observation, position)
+        if terrain["terrain"] in {"void", "water"}:
+            return None
+
+        cost = 2 if terrain["terrain"] == "hill" else 1
+        if terrain["feature"] == "forest":
+            cost += 1
+        elif terrain["feature"] == "marsh":
+            cost += 2
+        return cost
 
     def _step_away_from_enemies(
         self,

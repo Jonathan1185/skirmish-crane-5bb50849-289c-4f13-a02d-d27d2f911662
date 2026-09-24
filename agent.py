@@ -7,7 +7,7 @@ Read ``environment.md`` beside this file for the rules, helpers, and first impro
 episode state in ``reset``. The constructor takes no arguments.
 """
 
-from sandbox.crane import action, me, tile, visible
+from sandbox.crane import action, me, paths, tile, units, visible
 from sandbox.observation_types import AxialPosition, SkirmishAction, SkirmishObservation
 
 
@@ -15,11 +15,22 @@ class Agent:
     """Marches toward the enemy side, then steps toward the nearest visible enemy."""
 
     def reset(self, seed, observation) -> None:
-        # Called once before each match. The opening observation is available here for
-        # precomputation outside the decision clock. This starter stores no state.
-        pass
+        # Remember ally locations so an archer can fall back toward an ally even after
+        # that ally has moved outside the archer's current vision.
+        self.ally_positions = {
+            ally["unit_id"]: ally["position"]
+            for ally in visible.allies(observation)
+        }
 
     def act(self, observation: SkirmishObservation) -> SkirmishAction:
+        # Refresh any allies currently in view, while retaining their last known locations.
+        self.ally_positions.update(
+            {
+                ally["unit_id"]: ally["position"]
+                for ally in visible.allies(observation)
+            }
+        )
+
         # The enemies this unit can see.
         enemies = visible.enemies(observation)
 
@@ -37,15 +48,36 @@ class Agent:
             # It may still attack, but can you choose a better response?
             return action.stay()
 
-        # TODO(you): walking toward the nearest enemy is the entire strategy, and it is weak.
-        # An archer should shoot and back away, cavalry should swing wide for a flank, and a
-        # footman should hold the line beside an ally. What should each of your units do?
-
         # This unit's current {"q": ..., "r": ...} position.
         here = me.position(observation)
 
         # The closest enemy in sight. min returns the enemy dictionary, not the distance.
         nearest = min(enemies, key=lambda enemy: tile.distance(here, enemy["position"]))
+
+        # Archers are fragile. Fall back toward the nearest ally's last known location
+        # only when the closest enemy is already inside bow range.
+        if me.unit_type(observation) == "archer":
+            enemy_distance = tile.distance(here, nearest["position"])
+            archer_range = units.STATS["archer"].attack_range
+            if enemy_distance < archer_range:
+                if self.ally_positions:
+                    nearest_ally_position = min(
+                        self.ally_positions.values(),
+                        key=lambda position: tile.distance(here, position),
+                    )
+                else:
+                    nearest_ally_position = None
+
+                # Escape from every visible enemy, maximizing the distance gained.
+                # Allied support breaks ties between equally safe tiles.
+                retreat = self._step_away_from_enemies(
+                    observation, enemies, nearest_ally_position
+                )
+                if retreat:
+                    return action.move(retreat, nearest["unit_id"], observation)
+            return action.stay(nearest["unit_id"], observation)
+
+        # Footmen and cavalry continue to advance on the nearest visible enemy.
 
         # The step that gets closest to the enemy, or 0 when no step gets closer.
         step = self._step_toward(observation, nearest["position"])
@@ -75,6 +107,47 @@ class Agent:
                 best_step, best_distance = step, step_distance
 
         return best_step
+
+    def _step_away_from_enemies(
+        self,
+        observation: SkirmishObservation,
+        enemies: list[dict],
+        ally_position: AxialPosition | None,
+    ) -> int:
+        """Return a legal path that maximizes distance from visible enemies."""
+        here = me.position(observation)
+        current_enemy_distance = min(
+            tile.distance(here, enemy["position"]) for enemy in enemies
+        )
+        escape_paths = []
+
+        # legal_paths includes every route this archer can afford this turn, not
+        # only one-tile moves. Path 0 is standing still, so it cannot be an escape.
+        for path_id in action.legal_paths(observation):
+            if path_id == 0:
+                continue
+            landing = tile.at_path_end(here, path_id)
+            enemy_distance = min(
+                tile.distance(landing, enemy["position"]) for enemy in enemies
+            )
+            if enemy_distance > current_enemy_distance:
+                ally_distance = (
+                    tile.distance(landing, ally_position)
+                    if ally_position is not None
+                    else 0
+                )
+                escape_paths.append(
+                    (path_id, enemy_distance, len(paths.decode(path_id)), ally_distance)
+                )
+
+        if not escape_paths:
+            return 0
+
+        # Maximize distance from enemies, then use as many legal steps as possible.
+        # Only use ally distance to break a remaining tie.
+        return max(
+            escape_paths, key=lambda candidate: (candidate[1], candidate[2], -candidate[3])
+        )[0]
 
     # Optional: a reinforcement-learning hook called after every step with that step's
     # transition. Its time counts against the timing and episode budget. The order argument is
